@@ -1,4 +1,5 @@
-import sqlite3
+import os
+import json
 import asyncio
 from datetime import datetime, timedelta
 
@@ -7,8 +8,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
 
-TOKEN = "8440091071:AAGjsP1bSqLOjimx0nThir3iDSh7zcRUg7o"
-
+TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
@@ -20,22 +20,22 @@ USERS = {
 }
 
 
-db = sqlite3.connect("tasks.db")
-cur = db.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS tasks(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    text TEXT,
-    person TEXT,
-    due TEXT,
-    reminded INTEGER DEFAULT 0
-)
-""")
-db.commit()
+DB_FILE = "tasks.json"
 
 
-# ================= УТИЛИТЫ =================
+# ================= ХРАНИЛИЩЕ =================
+
+def load_tasks():
+    if not os.path.exists(DB_FILE):
+        return []
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_tasks(tasks):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False)
+
 
 def allowed(uid):
     return uid in USERS
@@ -58,30 +58,35 @@ def parse_due(d):
 
 async def reminder_loop():
     while True:
+        tasks = load_tasks()
         now = datetime.now()
 
-        cur.execute("SELECT id, text, person, due, reminded FROM tasks WHERE due IS NOT NULL")
-        rows = cur.fetchall()
+        changed = False
 
-        for tid, text, person, due, reminded in rows:
-            due_time = parse_due(due)
+        for t in tasks:
+            if not t["due"]:
+                continue
+
+            due_time = parse_due(t["due"])
             if not due_time:
                 continue
 
             diff = (due_time - now).total_seconds()
-            targets = receivers(person)
 
-            if 0 < diff <= 86400 and reminded == 0:
-                for uid in targets:
-                    await bot.send_message(uid, f"📅 Завтра\n{person} — {text}\n{due}")
-                cur.execute("UPDATE tasks SET reminded=1 WHERE id=?", (tid,))
-                db.commit()
+            if 0 < diff <= 86400 and t["reminded"] == 0:
+                for uid in receivers(t["person"]):
+                    await bot.send_message(uid, f"📅 Завтра\n{t['person']} — {t['text']}\n{t['due']}")
+                t["reminded"] = 1
+                changed = True
 
-            if 0 < diff <= 3600 and reminded == 1:
-                for uid in targets:
-                    await bot.send_message(uid, f"⏰ Через час\n{person} — {text}\n{due}")
-                cur.execute("UPDATE tasks SET reminded=2 WHERE id=?", (tid,))
-                db.commit()
+            if 0 < diff <= 3600 and t["reminded"] == 1:
+                for uid in receivers(t["person"]):
+                    await bot.send_message(uid, f"⏰ Через час\n{t['person']} — {t['text']}\n{t['due']}")
+                t["reminded"] = 2
+                changed = True
+
+        if changed:
+            save_tasks(tasks)
 
         await asyncio.sleep(60)
 
@@ -101,42 +106,19 @@ def main_menu():
     return kb
 
 
-def people_menu():
-    kb = InlineKeyboardMarkup()
-    for name in ["Юля", "Андрей", "Лиза", "Елисей", "Туман"]:
-        kb.add(InlineKeyboardButton(name, callback_data=f"p_{name}"))
-    return kb
-
-
 # ================= СТАРТ =================
 
 @dp.message_handler(commands=["start"])
 async def start(msg):
     if not allowed(msg.from_user.id):
         return
-
     await msg.answer(
-        "Добавление задачи:\n"
-        "Текст Имя, дата, время\n\n"
-        "Пример:\n"
-        "Танцы Лиза, 03.02.2026, 19:00",
+        "Формат:\nТекст Имя, дата, время\n\nПример:\nТанцы Лиза, 03.02.2026, 19:00",
         reply_markup=main_menu()
     )
 
 
-# ================= ДОБАВИТЬ =================
-
-@dp.callback_query_handler(lambda c: c.data == "add")
-async def add_help(call):
-    await call.message.answer(
-        "Введи:\n"
-        "Текст Имя, дата, время\n\n"
-        "Пример:\n"
-        "Танцы Лиза, 03.02.2026, 19:00"
-    )
-
-
-# ================= ДОБАВЛЕНИЕ ЧЕРЕЗ ТЕКСТ =================
+# ================= ДОБАВЛЕНИЕ =================
 
 @dp.message_handler()
 async def add_task(msg):
@@ -161,11 +143,16 @@ async def add_task(msg):
     if date != "-" and time != "-":
         due = f"{date} {time}"
 
-    cur.execute(
-        "INSERT INTO tasks(text, person, due) VALUES (?,?,?)",
-        (text, person, due)
-    )
-    db.commit()
+    tasks = load_tasks()
+
+    tasks.append({
+        "text": text,
+        "person": person,
+        "due": due,
+        "reminded": 0
+    })
+
+    save_tasks(tasks)
 
     await msg.answer("Добавлено ✅", reply_markup=main_menu())
 
@@ -175,73 +162,15 @@ async def add_task(msg):
 def show(msg, rows):
     if not rows:
         return msg.answer("Пусто")
-
-    text = "\n".join([f"{r[1]} — {r[0]} — {r[2] or 'без даты'}" for r in rows])
+    text = "\n".join(rows)
     return msg.answer(text)
 
 
 @dp.callback_query_handler(lambda c: c.data == "list")
 async def list_all(call):
-    cur.execute("SELECT text, person, due FROM tasks")
-    await show(call.message, cur.fetchall())
-
-
-# ===== ПО ЧЕЛОВЕКУ =====
-
-@dp.callback_query_handler(lambda c: c.data == "person")
-async def choose_person(call):
-    await call.message.answer("Кого показать?", reply_markup=people_menu())
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("p_"))
-async def show_person(call):
-    name = call.data[2:]
-    cur.execute("SELECT text, person, due FROM tasks WHERE person=?", (name,))
-    await show(call.message, cur.fetchall())
-
-
-# ===== СЕГОДНЯ/ЗАВТРА =====
-
-@dp.callback_query_handler(lambda c: c.data == "today")
-async def today(call):
-    today = datetime.now().date()
-
-    cur.execute("SELECT text, person, due FROM tasks WHERE due IS NOT NULL")
-    rows = [r for r in cur.fetchall() if parse_due(r[2]) and parse_due(r[2]).date() == today]
-
+    tasks = load_tasks()
+    rows = [f"{t['person']} — {t['text']} — {t['due'] or 'без даты'}" for t in tasks]
     await show(call.message, rows)
-
-
-@dp.callback_query_handler(lambda c: c.data == "tomorrow")
-async def tomorrow(call):
-    tomorrow = datetime.now().date() + timedelta(days=1)
-
-    cur.execute("SELECT text, person, due FROM tasks WHERE due IS NOT NULL")
-    rows = [r for r in cur.fetchall() if parse_due(r[2]) and parse_due(r[2]).date() == tomorrow]
-
-    await show(call.message, rows)
-
-
-# ===== УДАЛЕНИЕ =====
-
-@dp.callback_query_handler(lambda c: c.data == "delete")
-async def delete_menu(call):
-    cur.execute("SELECT id, text FROM tasks")
-    rows = cur.fetchall()
-
-    kb = InlineKeyboardMarkup()
-    for tid, text in rows:
-        kb.add(InlineKeyboardButton(text[:30], callback_data=f"del_{tid}"))
-
-    await call.message.answer("Что удалить?", reply_markup=kb)
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("del_"))
-async def delete_task(call):
-    tid = int(call.data[4:])
-    cur.execute("DELETE FROM tasks WHERE id=?", (tid,))
-    db.commit()
-    await call.message.answer("Удалено", reply_markup=main_menu())
 
 
 # ================= ЗАПУСК =================
